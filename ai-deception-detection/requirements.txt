@@ -3,3 +3,10 @@ datasets>=2.14.0
 python-dotenv>=1.0.0
 pandas>=2.0.0
 tqdm>=4.65.0
+langchain
+langchain-openai
+langchain-community
+faiss-cpu
+datasets
+pandas
+python-dotenv
