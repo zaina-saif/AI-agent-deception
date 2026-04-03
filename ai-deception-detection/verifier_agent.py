@@ -24,11 +24,10 @@ load_dotenv()
 
 # LangChain and FAISS imports
 from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import OpenAIEmbeddings
-from langchain_openai import ChatOpenAI
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
-from langchain.schema import Document
+from langchain_core.documents import Document
 
 # Dataset imports (assuming datasets are downloaded)
 import pandas as pd
@@ -52,8 +51,8 @@ class VerifierAgent:
     def __init__(
         self,
         openai_api_key: str,
-        embedding_model: str = "text-embedding-ada-002",
-        llm_model: str = "gpt-4",
+        embedding_model: str = "text-embedding-3-small",
+        llm_model: str = "gpt-4o-mini",
         top_k: int = 5
     ):
         """
@@ -68,17 +67,20 @@ class VerifierAgent:
         self.openai_api_key = openai_api_key
         self.top_k = top_k
 
+        embedding_model = os.getenv("VERIFIER_EMBEDDING_MODEL", embedding_model)
+        llm_model = os.getenv("VERIFIER_LLM_MODEL", llm_model)
+
         # Initialize embeddings
         self.embeddings = OpenAIEmbeddings(
             model=embedding_model,
-            openai_api_key=openai_api_key
+            api_key=openai_api_key,
         )
 
         # Initialize LLM
         self.llm = ChatOpenAI(
-            model_name=llm_model,
-            openai_api_key=openai_api_key,
-            temperature=0.1
+            model=llm_model,
+            api_key=openai_api_key,
+            temperature=0.1,
         )
 
         # Initialize vector store
@@ -196,8 +198,7 @@ Respond in JSON format with keys: "is_true", "confidence", "explanation", "evide
         if self.vector_store is None:
             raise ValueError("Vector store not initialized. Call build_index first.")
 
-        docs = self.vector_store.similarity_search(claim, k=self.top_k)
-        return docs
+        return self.vector_store.similarity_search(claim, k=self.top_k)
 
     def verify_claim(self, claim: str) -> VerificationResult:
         """
@@ -209,14 +210,18 @@ Respond in JSON format with keys: "is_true", "confidence", "explanation", "evide
         Returns:
             VerificationResult object
         """
-        # Retrieve relevant documents
-        docs = self.retrieve_documents(claim)
-
-        # Format documents for LLM
-        documents_text = "\n\n".join([
-            f"Document {i+1}: {doc.page_content}"
-            for i, doc in enumerate(docs)
-        ])
+        # Retrieve relevant documents (fallback if index failed to build)
+        if self.vector_store is None:
+            docs = []
+            documents_text = (
+                "(No FAISS index is available. Assess the claim using general knowledge only; "
+                "state lower confidence if unsure.)"
+            )
+        else:
+            docs = self.retrieve_documents(claim)
+            documents_text = "\n\n".join(
+                f"Document {i+1}: {doc.page_content}" for i, doc in enumerate(docs)
+            )
 
         # Run verification
         try:

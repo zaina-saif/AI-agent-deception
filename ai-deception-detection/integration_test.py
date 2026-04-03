@@ -2,7 +2,7 @@
 Integration test for the complete multi-agent pipeline
 
 Tests the integration between:
-- Generator (mock)
+- Generator (GeneratorAgent)
 - Ananya's Deception Detector
 - Zaina's Verifier + Retrieval
 
@@ -13,12 +13,14 @@ import os
 import sys
 import pandas as pd
 from dotenv import load_dotenv
-from pipeline import DeceptionDetectionPipeline
 
 load_dotenv()
 
-# Add paths for imports
-sys.path.append('/Users/zainasaif/Desktop/ai-deception/AI-agent-deception/ai-deception-detection')
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
+from pipeline import DeceptionDetectionPipeline
 from data.load_datasets import build_detection_pairs
 
 def test_pipeline_integration():

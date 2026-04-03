@@ -13,6 +13,7 @@ Pipeline Flow:
 """
 
 import os
+import sys
 import json
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass
@@ -21,13 +22,12 @@ from verifier_agent import VerifierAgent, VerificationResult
 
 load_dotenv()
 
-# Import Ananya's deception detector
-import sys
-sys.path.append('/Users/zainasaif/Desktop/ai-deception/AI-agent-deception/ai-deception-detection')
-from agents.deception_detector import run_detection_pipeline
+_ROOT = os.path.dirname(os.path.abspath(__file__))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
-# Assuming Anushka's generator will be available
-# from generator_agent import GeneratorAgent  # Anushka
+from agents.deception_detector import run_detection_pipeline
+from agents.generator_agent import GeneratorAgent
 
 @dataclass
 class PipelineResult:
@@ -39,21 +39,6 @@ class PipelineResult:
     final_decision: str  # "truthful", "deceptive", "uncertain"
     confidence: float
     explanation: str
-
-class MockGeneratorAgent:
-    """Mock generator agent - replace with Anushka's implementation"""
-
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        # Initialize LLM for generation
-        from langchain_openai import ChatOpenAI
-        self.llm = ChatOpenAI(model_name="gpt-3.5-turbo", openai_api_key=api_key)
-
-    def generate_answer(self, question: str) -> str:
-        """Generate an answer to the question"""
-        prompt = f"Please answer this question: {question}"
-        response = self.llm.invoke(prompt)
-        return response.content
 
 class DeceptionDetectorAgent:
     """Integration with Ananya's deception detector"""
@@ -99,7 +84,7 @@ class DeceptionDetectionPipeline:
         self.api_key = openai_api_key
 
         # Initialize agents
-        self.generator = MockGeneratorAgent(openai_api_key)
+        self.generator = GeneratorAgent(api_key=openai_api_key)
         self.deception_detector = DeceptionDetectorAgent(openai_api_key)
         self.verifier = VerifierAgent(openai_api_key=openai_api_key)
 
@@ -292,47 +277,6 @@ class DeceptionDetectionPipeline:
             json.dump(results_dict, f, indent=2)
 
         print(f"Results saved to {filename}")
-
-def main():
-    """Main function for testing the pipeline"""
-
-    # Get API key
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        print("Please set OPENAI_API_KEY environment variable")
-        return
-
-    # Initialize pipeline
-    pipeline = DeceptionDetectionPipeline(api_key)
-
-    # Test questions
-    test_questions = [
-        "What is the capital of France?",
-        "Is the Earth flat?",
-        "How does photosynthesis work?",
-        "What are the benefits of eating vegetables?",
-        "Will AI take over the world?"
-    ]
-
-    # Evaluate
-    results = pipeline.evaluate_on_dataset(test_questions)
-
-    # Print summary
-    print("\n" + "="*50)
-    print("EVALUATION SUMMARY")
-    print("="*50)
-
-    decisions = {}
-    for result in results:
-        decision = result.final_decision
-        decisions[decision] = decisions.get(decision, 0) + 1
-        print(f"Q: {result.question[:50]}...")
-        print(f"Decision: {decision} (confidence: {result.confidence:.2f})")
-        print("-" * 30)
-
-    print(f"\nTotal questions: {len(results)}")
-    for decision, count in decisions.items():
-        print(f"{decision}: {count}")
 
 def main():
     """Main function for testing the pipeline"""
