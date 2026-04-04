@@ -144,27 +144,22 @@ Respond in JSON format with keys: "is_true", "confidence", "explanation", "evide
             print(f"Warning: Could not load TruthfulQA: {e}")
 
         try:
-            # Load HaluEval dataset (assuming it's available)
-            # Note: HaluEval might need to be downloaded separately
-            halu_eval_path = "path/to/halueval/data.json"  # Adjust path as needed
-            if os.path.exists(halu_eval_path):
-                with open(halu_eval_path, 'r') as f:
-                    halu_data = json.load(f)
-
-                for item in halu_data:
-                    # Add faithful answers
-                    doc = Document(
-                        page_content=f"Question: {item['question']}\nAnswer: {item['faithful_answer']}",
-                        metadata={"source": "halueval", "type": "faithful"}
-                    )
-                    documents.append(doc)
-
-                    # Add hallucinated answers
-                    doc = Document(
-                        page_content=f"Question: {item['question']}\nAnswer: {item['hallucinated_answer']}",
-                        metadata={"source": "halueval", "type": "hallucinated"}
-                    )
-                    documents.append(doc)
+            # Load HaluEval dataset from HuggingFace
+            from datasets import load_dataset as _load_dataset
+            halu = _load_dataset("pminervini/HaluEval", "qa")
+            # Dataset may have a "data" split or default train split
+            halu_split = halu.get("data") or halu[list(halu.keys())[0]]
+            for item in halu_split:
+                doc = Document(
+                    page_content=f"Question: {item['question']}\nAnswer: {item['right_answer']}",
+                    metadata={"source": "halueval", "type": "faithful"}
+                )
+                documents.append(doc)
+                doc = Document(
+                    page_content=f"Question: {item['question']}\nAnswer: {item['hallucinated_answer']}",
+                    metadata={"source": "halueval", "type": "hallucinated"}
+                )
+                documents.append(doc)
 
         except Exception as e:
             print(f"Warning: Could not load HaluEval: {e}")
