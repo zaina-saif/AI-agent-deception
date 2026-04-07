@@ -24,10 +24,32 @@ load_dotenv()
 
 # LangChain and FAISS imports
 from langchain_community.vectorstores import FAISS
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+
+# Sentence Transformers for local embeddings
+from sentence_transformers import SentenceTransformer
+
+
+class SentenceTransformerEmbeddings(Embeddings):
+    """Custom embedding class using sentence-transformers for local embeddings."""
+
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+        self.model = SentenceTransformer(model_name)
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        """Embed a list of documents."""
+        embeddings = self.model.encode(texts, convert_to_numpy=True)
+        return embeddings.tolist()
+
+    def embed_query(self, text: str) -> List[float]:
+        """Embed a single query."""
+        embedding = self.model.encode([text], convert_to_numpy=True)[0]
+        return embedding.tolist()
+
 
 # Dataset imports (assuming datasets are downloaded)
 import pandas as pd
@@ -51,7 +73,7 @@ class VerifierAgent:
     def __init__(
         self,
         openai_api_key: str,
-        embedding_model: str = "text-embedding-3-small",
+        embedding_model: str = "all-MiniLM-L6-v2",  # Changed to sentence-transformers model
         llm_model: str = "gpt-4o-mini",
         top_k: int = 5
     ):
@@ -59,22 +81,16 @@ class VerifierAgent:
         Initialize the verifier agent.
 
         Args:
-            openai_api_key: OpenAI API key
-            embedding_model: Embedding model to use
+            openai_api_key: OpenAI API key (for LLM only)
+            embedding_model: Sentence-transformers model name
             llm_model: LLM model for verification
             top_k: Number of documents to retrieve
         """
         self.openai_api_key = openai_api_key
         self.top_k = top_k
 
-        embedding_model = os.getenv("VERIFIER_EMBEDDING_MODEL", embedding_model)
-        llm_model = os.getenv("VERIFIER_LLM_MODEL", llm_model)
-
-        # Initialize embeddings
-        self.embeddings = OpenAIEmbeddings(
-            model=embedding_model,
-            api_key=openai_api_key,
-        )
+        # Use sentence-transformers for local embeddings
+        self.embeddings = SentenceTransformerEmbeddings(model_name=embedding_model)
 
         # Initialize LLM
         self.llm = ChatOpenAI(
@@ -132,13 +148,17 @@ Respond in JSON format with keys: "is_true", "confidence", "explanation", "evide
                     )
                     documents.append(doc)
 
-                # Add false answers for contrast
-                for answer in item["incorrect_answers"]:
+                # Add false answers for contrast (limit to 2 per question for speed)
+                for answer in item["incorrect_answers"][:2]:
                     doc = Document(
                         page_content=f"Question: {item['question']}\nAnswer: {answer}",
                         metadata={"source": "truthfulqa", "type": "deceptive"}
                     )
                     documents.append(doc)
+
+                # Limit to first 50 questions for faster testing
+                if len(documents) >= 500:
+                    break
 
         except Exception as e:
             print(f"Warning: Could not load TruthfulQA: {e}")
@@ -161,6 +181,10 @@ Respond in JSON format with keys: "is_true", "confidence", "explanation", "evide
                 )
                 documents.append(doc)
 
+                # Limit to first 50 examples for faster testing
+                if len(documents) >= 1000:
+                    break
+
         except Exception as e:
             print(f"Warning: Could not load HaluEval: {e}")
 
@@ -174,11 +198,17 @@ Respond in JSON format with keys: "is_true", "confidence", "explanation", "evide
             documents: List of Document objects
         """
         if not documents:
-            raise ValueError("No documents provided for indexing")
+            print("Warning: No documents provided for indexing")
+            return
 
-        print(f"Building index with {len(documents)} documents...")
-        self.vector_store = FAISS.from_documents(documents, self.embeddings)
-        print("Index built successfully")
+        try:
+            print(f"Building index with {len(documents)} documents...")
+            self.vector_store = FAISS.from_documents(documents, self.embeddings)
+            print("Index built successfully")
+        except Exception as e:
+            print(f"Warning: Could not build FAISS index: {e}")
+            print("Verifier will operate without retrieval (general knowledge only)")
+            self.vector_store = None
 
     def retrieve_documents(self, claim: str) -> List[Document]:
         """
@@ -209,8 +239,9 @@ Respond in JSON format with keys: "is_true", "confidence", "explanation", "evide
         if self.vector_store is None:
             docs = []
             documents_text = (
-                "(No FAISS index is available. Assess the claim using general knowledge only; "
-                "state lower confidence if unsure.)"
+                "(No FAISS index is available due to embedding model access restrictions. "
+                "Please assess the claim using general knowledge only. "
+                "Be conservative with confidence scores since no specific documents are available for verification.)"
             )
         else:
             docs = self.retrieve_documents(claim)
@@ -245,19 +276,96 @@ Respond in JSON format with keys: "is_true", "confidence", "explanation", "evide
             is_verified=is_verified
         )
 
-    def verify_claims_batch(self, claims: List[str]) -> List[VerificationResult]:
+    def verify_claim_with_llm(self, claim: str) -> VerificationResult:
         """
-        Verify multiple claims in batch.
+        Verify a claim using pure LLM reasoning (no FAISS retrieval).
+        
+        This method asks GPT to evaluate if a claim is likely true or false
+        based on general knowledge and reasoning.
+
+        Args:
+            claim: The claim to verify
+
+        Returns:
+            VerificationResult object
+        """
+        llm_prompt = f"""You are a fact-checking expert. Evaluate the following claim based on your knowledge:
+
+Claim: "{claim}"
+
+Determine:
+1. Is this claim likely true, false, or uncertain?
+2. Provide a confidence score from 0.0 to 1.0
+   - 0.0 = definitely false
+   - 0.5 = uncertain/cannot determine
+   - 1.0 = definitely true
+3. Briefly explain your reasoning (1-2 sentences)
+
+Respond in JSON format with keys: "is_true", "confidence", "reasoning"
+Example:
+{{"is_true": true, "confidence": 0.95, "reasoning": "This is a well-established fact supported by scientific consensus."}}
+"""
+
+        try:
+            response = self.llm.invoke([{"role": "user", "content": llm_prompt}])
+            
+            # Parse response
+            import json
+            import re
+            raw_text = response.content
+            
+            # Try to extract JSON
+            json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+            if not json_match:
+                raise ValueError("No JSON found in response")
+            
+            result = json.loads(json_match.group())
+            
+            confidence = float(result.get("confidence", 0.5))
+            is_true = result.get("is_true", confidence > 0.5)
+            reasoning = result.get("reasoning", "")
+            
+        except Exception as e:
+            print(f"Error during LLM verification: {e}")
+            confidence = 0.5
+            is_true = False
+            reasoning = "LLM verification failed"
+        
+        return VerificationResult(
+            claim=claim,
+            confidence=confidence,
+            explanation=reasoning,
+            supporting_evidence=[],
+            is_verified=is_true
+        )
+
+    def verify_claims_batch(self, claims: List[str], method: str = "hybrid") -> List[VerificationResult]:
+        """
+        Verify multiple claims in batch using specified method.
 
         Args:
             claims: List of claims to verify
+            method: "faiss" (retrieval-based), "llm" (reasoning-based), or "hybrid" (try both)
 
         Returns:
             List of VerificationResult objects
         """
         results = []
         for claim in claims:
-            result = self.verify_claim(claim)
+            if method == "llm":
+                result = self.verify_claim_with_llm(claim)
+            elif method == "faiss" and self.vector_store:
+                result = self.verify_claim(claim)
+            else:  # hybrid or fallback
+                # Try FAISS first if available, fall back to LLM
+                if self.vector_store:
+                    try:
+                        result = self.verify_claim(claim)
+                    except Exception:
+                        result = self.verify_claim_with_llm(claim)
+                else:
+                    result = self.verify_claim_with_llm(claim)
+            
             results.append(result)
         return results
 

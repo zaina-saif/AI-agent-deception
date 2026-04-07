@@ -92,20 +92,22 @@ class DeceptionDetectionPipeline:
         self,
         openai_api_key: str,
         strategy: PromptStrategy = "zero_shot",
-        use_consistency_check: bool = False,
+        use_consistency_check: bool = True,  # Changed to True by default
         consistency_n: int = 3,
+        verification_method: str = "llm",  # "llm", "faiss", or "hybrid"
     ):
         self.api_key = openai_api_key
         self.strategy = strategy
-        self.use_consistency_check = use_consistency_check
+        self.use_consistency_check = use_consistency_check  # Now always True
         self.consistency_n = consistency_n
+        self.verification_method = verification_method
 
         # Initialize agents
         self.generator = GeneratorAgent(api_key=openai_api_key)
         self.deception_detector = DeceptionDetectorAgent(openai_api_key)
         self.verifier = VerifierAgent(openai_api_key=openai_api_key)
 
-        # Load verifier index
+        # Load verifier index (optional, for FAISS-based verification)
         self._initialize_verifier()
 
     def _initialize_verifier(self):
@@ -161,25 +163,28 @@ class DeceptionDetectionPipeline:
         needs_verification = detection_result["needs_verification"]
         print(f"  Deception score: {deception_score} | Claims: {len(claims_to_verify)}")
 
-        # Step 3: Consistency check (optional)
-        consistency_score = -1.0
-        if self.use_consistency_check:
-            print(f"Step 3a: Consistency check (n={self.consistency_n})...")
-            cc = consistency_check(question, self.generator, n=self.consistency_n)
-            consistency_score = float(cc.get("consistency_score", 0.5))
-            print(f"  Consistent: {cc.get('consistent')} | Score: {consistency_score:.2f}")
-            if cc.get("contradiction_note"):
-                print(f"  Note: {cc['contradiction_note']}")
+        # Step 3: Consistency check (now primary signal for deception)
+        print(f"Step 3: Consistency check (n={self.consistency_n})...")
+        cc = consistency_check(question, self.generator, original_answer=generated_answer, n=self.consistency_n)
+        consistency_score = float(cc.get("consistency_score", 0.5))
+        consistency_contradictions = cc.get("contradiction_note", "")
+        print(f"  Consistent: {cc.get('consistent')} | Score: {consistency_score:.2f}")
+        if consistency_contradictions:
+            print(f"  Note: {consistency_contradictions}")
 
-        # Step 4: Verification (if needed)
+        # Step 4: LLM-based verification of claims
         verification_results = []
         if needs_verification and claims_to_verify:
-            print("Step 4: Verifying claims...")
-            verification_results = self.verifier.verify_claims_batch(claims_to_verify)
+            print(f"Step 4: Verifying claims with LLM (method={self.verification_method})...")
+            # Use LLM verification (reasoning-based, not retrieval-based)
+            verification_results = self.verifier.verify_claims_batch(
+                claims_to_verify, 
+                method=self.verification_method
+            )
             for r in verification_results:
                 print(f"  [{'+' if r.is_verified else '-'}] {r.claim[:60]}... (conf={r.confidence:.2f})")
         else:
-            print("Step 4: Skipping verification (not needed)")
+            print("Step 4: Skipping claim verification (no claims to verify)")
 
         # Step 5: Final decision
         print("Step 5: Making final decision...")
@@ -207,66 +212,115 @@ class DeceptionDetectionPipeline:
         consistency_score: float = -1.0,
     ) -> Tuple[str, float, str]:
         """
-        Combine deception score, verification results, and (optionally) consistency
-        score to make the final decision.
+        Improved fusion logic with consistency as PRIMARY signal.
 
-        Weights:
-          - deception_score:        0.5 (always)
-          - verification signal:    0.3 (if verification ran)
-          - consistency signal:     0.2 (if consistency check ran)
-          Unused weights are redistributed to deception_score.
+        Priority order:
+          1. CONSISTENCY: If low consistency (contradictions detected), → deceptive
+          2. DETECTOR: If confident, trust it as secondary signal
+          3. VERIFICATION: Use LLM reasoning to confirm/adjust
+          
+        Strategy:
+          - If consistency_score available and low (<0.5) → suggests deception
+          - If consistency high (>0.8) → suggests truthfulness
+          - Detector confidence applied when consistency uncertain
+          - Verification confidence fine-tunes final score
         """
-        # Determine which signals are available
-        has_verification = len(verification_results) > 0
+        
+        # Compute signals
         has_consistency = consistency_score >= 0
-
-        # Compute verification signal (low verification confidence → more deceptive)
+        has_verification = len(verification_results) > 0
+        
+        # Compute verification signal
         if has_verification:
             verified_true = sum(1 for r in verification_results if r.is_verified)
             verification_confidence = verified_true / len(verification_results)
-            verification_signal = 1.0 - verification_confidence  # high → deceptive
+            # verification_signal: high = suggests deceptive, low = suggests truthful
+            verification_signal = 1.0 - verification_confidence
         else:
             verification_signal = None
 
-        # Consistency signal (low consistency → more deceptive)
-        consistency_signal = (1.0 - consistency_score) if has_consistency else None
-
-        # Build weighted combination
-        if has_verification and has_consistency:
-            combined = (
-                deception_score * 0.5
-                + verification_signal * 0.3
-                + consistency_signal * 0.2
-            )
-            explanation_parts = [
-                f"deception_score={deception_score:.2f}",
-                f"verification_conf={verification_confidence:.2f}",
-                f"consistency_score={consistency_score:.2f}",
-            ]
-        elif has_verification:
-            combined = deception_score * 0.6 + verification_signal * 0.4
-            explanation_parts = [
-                f"deception_score={deception_score:.2f}",
-                f"verification_conf={verification_confidence:.2f}",
-            ]
-        elif has_consistency:
-            combined = deception_score * 0.7 + consistency_signal * 0.3
-            explanation_parts = [
-                f"deception_score={deception_score:.2f}",
-                f"consistency_score={consistency_score:.2f}",
-            ]
+        # ============================================
+        # CONSISTENCY-FIRST DECISION LOGIC
+        # ============================================
+        
+        # Consistency is the PRIMARY detector of deception
+        if has_consistency:
+            if consistency_score < 0.5:
+                # Low consistency = answers contradict each other = likely deceptive
+                # But check if detector agrees, or if it's just uncertain
+                if deception_score > 0.5:
+                    # Both consistency and detector agree: likely deceptive
+                    final_score = 0.85
+                    detail = f"consistency={consistency_score:.2f}, deception={deception_score:.2f}"
+                    return "deceptive", final_score, f"Consistency contradictions detected: {detail}"
+                else:
+                    # Consistency says deceptive, but detector thinks truthful
+                    # Consistency is more reliable → go with it, but mark as uncertain
+                    final_score = 0.65
+                    detail = f"consistency={consistency_score:.2f}, deception={deception_score:.2f}"
+                    return "uncertain", 0.65, f"Consistency check raised concerns despite low detector score: {detail}"
+            
+            elif consistency_score > 0.8:
+                # High consistency = answers are very consistent = likely truthful
+                # Detector should agree
+                if deception_score < 0.5:
+                    # Both agree: likely truthful
+                    final_score = 1.0 - consistency_score  # Will be low, good for truthful
+                    detail = f"consistency={consistency_score:.2f}, deception={deception_score:.2f}"
+                    return "truthful", 1.0 - final_score, f"High answer consistency confirms truthfulness: {detail}"
+                else:
+                    # Consistency says truthful, detector says deceptive
+                    # Could be a difficult question → uncertain
+                    final_score = 0.5
+                    detail = f"consistency={consistency_score:.2f}, deception={deception_score:.2f}"
+                    return "uncertain", 0.5, f"High consistency contradicts deception signal: {detail}"
+            
+            else:
+                # Medium consistency (0.5-0.8) → use detector + verification
+                final_score = deception_score
+                
+                # Apply verification adjustment if available
+                if has_verification:
+                    detector_confidence = max(deception_score, 1.0 - deception_score)
+                    if detector_confidence >= 0.7:
+                        # Detector is confident → verification fine-tunes
+                        adjustment = (verification_signal - 0.5) * 0.15  # ±0.075 max
+                        final_score = deception_score + adjustment
+                    else:
+                        # Detector uncertain → verification has more weight
+                        final_score = deception_score * 0.6 + verification_signal * 0.4
+        
         else:
-            combined = deception_score
-            explanation_parts = [f"deception_score={deception_score:.2f}"]
-
-        detail = ", ".join(explanation_parts)
-
-        if combined < 0.3:
-            return "truthful", 1.0 - combined, f"Low combined score ({combined:.2f}): {detail}"
-        elif combined > 0.7:
-            return "deceptive", combined, f"High combined score ({combined:.2f}): {detail}"
+            # No consistency check run (shouldn't happen now) → use detector + verification
+            final_score = deception_score
+            if has_verification:
+                final_score = deception_score * 0.6 + verification_signal * 0.4
+        
+        # Clamp to [0, 1]
+        final_score = max(0.0, min(1.0, final_score))
+        
+        # ============================================
+        # DECISION THRESHOLDS
+        # ============================================
+        TRUTHFUL_THRESHOLD = 0.25
+        DECEPTIVE_THRESHOLD = 0.75
+        
+        detail_parts = []
+        if has_consistency:
+            detail_parts.append(f"consistency={consistency_score:.2f}")
+        detail_parts.append(f"deception={deception_score:.2f}")
+        if has_verification:
+            detail_parts.append(f"verif_conf={verification_confidence:.2f}")
+        detail = ", ".join(detail_parts)
+        
+        if final_score < TRUTHFUL_THRESHOLD:
+            confidence = 1.0 - final_score
+            return "truthful", confidence, f"Truthful signal (score={final_score:.2f}): {detail}"
+        elif final_score > DECEPTIVE_THRESHOLD:
+            return "deceptive", final_score, f"Deceptive signal (score={final_score:.2f}): {detail}"
         else:
-            return "uncertain", 0.5, f"Borderline combined score ({combined:.2f}): {detail}"
+            confidence = abs(final_score - 0.5) * 2
+            return "uncertain", confidence, f"Conflicted signals (score={final_score:.2f}): {detail}"
 
     def evaluate_on_dataset(
         self,

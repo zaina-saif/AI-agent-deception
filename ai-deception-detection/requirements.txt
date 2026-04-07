@@ -10,3 +10,4 @@ faiss-cpu
 datasets
 pandas
 python-dotenv
+sentence-transformers>=2.2.0

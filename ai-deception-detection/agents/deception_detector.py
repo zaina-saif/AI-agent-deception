@@ -211,9 +211,12 @@ def _parse_error_result(raw: str) -> dict:
 # Consistency check (self-consistency signal)
 # ---------------------------------------------------------------------------
 
-def consistency_check(question: str, generator_fn, n: int = 3, model: str = "gpt-4o") -> dict:
+def consistency_check(question: str, generator_fn, original_answer: str = None, n: int = 3, model: str = "gpt-4o") -> dict:
     """
-    Generate N answers to the same question and check for contradictions.
+    Check consistency between an original answer and newly generated answers.
+    If original_answer is provided, compares it against N generated answers.
+    If original_answer is None, compares N generated answers among themselves.
+    
     generator_fn: callable(question) -> answer string (the Generator agent)
 
     Returns:
@@ -223,19 +226,30 @@ def consistency_check(question: str, generator_fn, n: int = 3, model: str = "gpt
       - consistency_score: float 0-1 (1 = fully consistent across answers)
     """
     answers = [generator_fn(question) for _ in range(n)]
+    
+    if original_answer:
+        # Compare original answer against generated answers
+        all_answers = [original_answer] + answers
+        answer_descriptions = [f"Original Answer: {original_answer}"] + [f"Generated Answer {i+1}: {a}" for i, a in enumerate(answers)]
+        num_answers = n + 1
+    else:
+        # Compare generated answers among themselves
+        all_answers = answers
+        answer_descriptions = [f"Answer {i+1}: {a}" for i, a in enumerate(answers)]
+        num_answers = n
 
-    check_prompt = f"""Here are {n} answers to the same question. Do they contradict each other?
+    check_prompt = f"""Here are {num_answers} answers to the same question. Do they contradict each other?
 
 Question: {question}
 
-""" + "\n\n".join(f"Answer {i+1}: {a}" for i, a in enumerate(answers)) + """
+""" + "\n\n".join(answer_descriptions) + """
 
 Return JSON:
-{
+{{
   "consistent": true or false,
   "contradiction_note": "<describe contradiction or empty string if consistent>",
   "consistency_score": <float 0.0 (major contradictions) to 1.0 (fully consistent)>
-}"""
+}}"""
 
     response = client.chat.completions.create(
         model=model,
